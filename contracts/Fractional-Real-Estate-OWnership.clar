@@ -10,10 +10,16 @@
 (define-constant ERR-PROPERTY-NOT-ACTIVE (err u107))
 (define-constant ERR-INVALID-PRICE (err u108))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u109))
+(define-constant ERR-POOL-NOT-FOUND (err u110))
+(define-constant ERR-SLIPPAGE-EXCEEDED (err u111))
+(define-constant ERR-POOL-EXISTS (err u112))
+(define-constant ERR-INSUFFICIENT-LIQUIDITY (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var property-counter uint u0)
 (define-data-var platform-fee uint u250)
+(define-data-var liquidity-fee uint u300)
+(define-data-var price-impact-factor uint u1000)
 
 (define-map properties
   { property-id: uint }
@@ -51,6 +57,33 @@
 (define-map user-dividend-claims
   { user: principal, property-id: uint }
   { last-claim-block: uint }
+)
+
+(define-map liquidity-pools
+  { property-id: uint }
+  {
+    stx-reserve: uint,
+    token-reserve: uint,
+    total-supply: uint,
+    base-price: uint,
+    last-trade-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map pool-shares
+  { property-id: uint, provider: principal }
+  { shares: uint }
+)
+
+(define-map trade-history
+  { property-id: uint, block-height: uint }
+  {
+    trade-type: (string-ascii 10),
+    amount: uint,
+    price: uint,
+    trader: principal
+  }
 )
 
 (define-public (create-property (address (string-ascii 200)) (property-value uint) (total-tokens uint))
@@ -305,6 +338,200 @@
   )
 )
 
+(define-public (create-liquidity-pool (property-id uint) (initial-stx uint) (initial-tokens uint))
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (base-price (/ initial-stx initial-tokens))
+      (initial-shares (if (< initial-stx initial-tokens) initial-stx initial-tokens))
+    )
+    (asserts! (is-none (map-get? liquidity-pools { property-id: property-id })) ERR-POOL-EXISTS)
+    (asserts! (> initial-stx u0) ERR-INVALID-AMOUNT)
+    (asserts! (> initial-tokens u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= user-tokens initial-tokens) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= (stx-get-balance tx-sender) initial-stx) ERR-INSUFFICIENT-FUNDS)
+    
+    (try! (stx-transfer? initial-stx tx-sender (as-contract tx-sender)))
+    
+    (map-set property-ownership
+      { property-id: property-id, owner: tx-sender }
+      { tokens: (- user-tokens initial-tokens) }
+    )
+    
+    (map-set liquidity-pools
+      { property-id: property-id }
+      {
+        stx-reserve: initial-stx,
+        token-reserve: initial-tokens,
+        total-supply: initial-shares,
+        base-price: base-price,
+        last-trade-block: stacks-block-height,
+        is-active: true
+      }
+    )
+    
+    (map-set pool-shares
+      { property-id: property-id, provider: tx-sender }
+      { shares: initial-shares }
+    )
+    
+    (ok initial-shares)
+  )
+)
+
+(define-public (add-liquidity (property-id uint) (stx-amount uint) (max-tokens uint))
+  (let
+    (
+      (pool (unwrap! (map-get? liquidity-pools { property-id: property-id }) ERR-POOL-NOT-FOUND))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (current-shares (get-pool-shares property-id tx-sender))
+      (tokens-needed (/ (* stx-amount (get token-reserve pool)) (get stx-reserve pool)))
+      (shares-to-mint (/ (* stx-amount (get total-supply pool)) (get stx-reserve pool)))
+    )
+    (asserts! (get is-active pool) ERR-POOL-NOT-FOUND)
+    (asserts! (> stx-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= tokens-needed max-tokens) ERR-SLIPPAGE-EXCEEDED)
+    (asserts! (>= user-tokens tokens-needed) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= (stx-get-balance tx-sender) stx-amount) ERR-INSUFFICIENT-FUNDS)
+    
+    (try! (stx-transfer? stx-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set property-ownership
+      { property-id: property-id, owner: tx-sender }
+      { tokens: (- user-tokens tokens-needed) }
+    )
+    
+    (map-set liquidity-pools
+      { property-id: property-id }
+      (merge pool
+        {
+          stx-reserve: (+ (get stx-reserve pool) stx-amount),
+          token-reserve: (+ (get token-reserve pool) tokens-needed),
+          total-supply: (+ (get total-supply pool) shares-to-mint)
+        }
+      )
+    )
+    
+    (map-set pool-shares
+      { property-id: property-id, provider: tx-sender }
+      { shares: (+ current-shares shares-to-mint) }
+    )
+    
+    (ok shares-to-mint)
+  )
+)
+
+(define-public (amm-buy-tokens (property-id uint) (token-amount uint) (max-stx-cost uint))
+  (let
+    (
+      (pool (unwrap! (map-get? liquidity-pools { property-id: property-id }) ERR-POOL-NOT-FOUND))
+      (stx-cost (get-buy-price property-id token-amount))
+      (fee-amount (/ (* stx-cost (var-get liquidity-fee)) u10000))
+      (total-cost (+ stx-cost fee-amount))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (new-stx-reserve (+ (get stx-reserve pool) stx-cost))
+      (new-token-reserve (- (get token-reserve pool) token-amount))
+    )
+    (asserts! (get is-active pool) ERR-POOL-NOT-FOUND)
+    (asserts! (> token-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= total-cost max-stx-cost) ERR-SLIPPAGE-EXCEEDED)
+    (asserts! (>= (get token-reserve pool) token-amount) ERR-INSUFFICIENT-LIQUIDITY)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
+    
+    (try! (stx-transfer? stx-cost tx-sender (as-contract tx-sender)))
+    (try! (stx-transfer? fee-amount tx-sender (var-get contract-owner)))
+    
+    (map-set liquidity-pools
+      { property-id: property-id }
+      (merge pool
+        {
+          stx-reserve: new-stx-reserve,
+          token-reserve: new-token-reserve,
+          last-trade-block: stacks-block-height
+        }
+      )
+    )
+    
+    (map-set property-ownership
+      { property-id: property-id, owner: tx-sender }
+      { tokens: (+ user-tokens token-amount) }
+    )
+    
+    (map-set user-properties
+      { user: tx-sender, property-id: property-id }
+      { tokens: (+ user-tokens token-amount) }
+    )
+    
+    (map-set trade-history
+      { property-id: property-id, block-height: stacks-block-height }
+      {
+        trade-type: "buy",
+        amount: token-amount,
+        price: (/ stx-cost token-amount),
+        trader: tx-sender
+      }
+    )
+    
+    (ok token-amount)
+  )
+)
+
+(define-public (amm-sell-tokens (property-id uint) (token-amount uint) (min-stx-receive uint))
+  (let
+    (
+      (pool (unwrap! (map-get? liquidity-pools { property-id: property-id }) ERR-POOL-NOT-FOUND))
+      (stx-receive (get-sell-price property-id token-amount))
+      (fee-amount (/ (* stx-receive (var-get liquidity-fee)) u10000))
+      (net-receive (- stx-receive fee-amount))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (new-stx-reserve (- (get stx-reserve pool) stx-receive))
+      (new-token-reserve (+ (get token-reserve pool) token-amount))
+    )
+    (asserts! (get is-active pool) ERR-POOL-NOT-FOUND)
+    (asserts! (> token-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= net-receive min-stx-receive) ERR-SLIPPAGE-EXCEEDED)
+    (asserts! (>= user-tokens token-amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= (get stx-reserve pool) stx-receive) ERR-INSUFFICIENT-LIQUIDITY)
+    
+    (try! (as-contract (stx-transfer? net-receive tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? fee-amount tx-sender (var-get contract-owner))))
+    
+    (map-set liquidity-pools
+      { property-id: property-id }
+      (merge pool
+        {
+          stx-reserve: new-stx-reserve,
+          token-reserve: new-token-reserve,
+          last-trade-block: stacks-block-height
+        }
+      )
+    )
+    
+    (map-set property-ownership
+      { property-id: property-id, owner: tx-sender }
+      { tokens: (- user-tokens token-amount) }
+    )
+    
+    (map-set user-properties
+      { user: tx-sender, property-id: property-id }
+      { tokens: (- user-tokens token-amount) }
+    )
+    
+    (map-set trade-history
+      { property-id: property-id, block-height: stacks-block-height }
+      {
+        trade-type: "sell",
+        amount: token-amount,
+        price: (/ stx-receive token-amount),
+        trader: tx-sender
+      }
+    )
+    
+    (ok net-receive)
+  )
+)
+
 (define-read-only (get-property (property-id uint))
   (map-get? properties { property-id: property-id })
 )
@@ -335,4 +562,61 @@
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
+)
+
+(define-read-only (get-liquidity-pool (property-id uint))
+  (map-get? liquidity-pools { property-id: property-id })
+)
+
+(define-read-only (get-pool-shares (property-id uint) (provider principal))
+  (default-to u0 (get shares (map-get? pool-shares { property-id: property-id, provider: provider })))
+)
+
+(define-read-only (get-current-price (property-id uint))
+  (match (map-get? liquidity-pools { property-id: property-id })
+    pool
+    (if (> (get token-reserve pool) u0)
+      (/ (get stx-reserve pool) (get token-reserve pool))
+      (get base-price pool)
+    )
+    u0
+  )
+)
+
+(define-read-only (get-buy-price (property-id uint) (token-amount uint))
+  (match (map-get? liquidity-pools { property-id: property-id })
+    pool
+    (let
+      (
+        (stx-reserve (get stx-reserve pool))
+        (token-reserve (get token-reserve pool))
+        (k (* stx-reserve token-reserve))
+        (new-token-reserve (+ token-reserve token-amount))
+        (new-stx-reserve (/ k new-token-reserve))
+        (stx-needed (- stx-reserve new-stx-reserve))
+        (price-impact (/ (* stx-needed (var-get price-impact-factor)) u10000))
+      )
+      (+ stx-needed price-impact)
+    )
+    u0
+  )
+)
+
+(define-read-only (get-sell-price (property-id uint) (token-amount uint))
+  (match (map-get? liquidity-pools { property-id: property-id })
+    pool
+    (let
+      (
+        (stx-reserve (get stx-reserve pool))
+        (token-reserve (get token-reserve pool))
+        (k (* stx-reserve token-reserve))
+        (new-token-reserve (- token-reserve token-amount))
+        (new-stx-reserve (/ k new-token-reserve))
+        (stx-received (- new-stx-reserve stx-reserve))
+        (price-impact (/ (* stx-received (var-get price-impact-factor)) u10000))
+      )
+      (- stx-received price-impact)
+    )
+    u0
+  )
 )
