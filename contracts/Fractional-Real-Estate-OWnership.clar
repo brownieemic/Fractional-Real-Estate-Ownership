@@ -14,12 +14,21 @@
 (define-constant ERR-SLIPPAGE-EXCEEDED (err u111))
 (define-constant ERR-POOL-EXISTS (err u112))
 (define-constant ERR-INSUFFICIENT-LIQUIDITY (err u113))
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u114))
+(define-constant ERR-VOTING-ENDED (err u115))
+(define-constant ERR-VOTING-NOT-ENDED (err u116))
+(define-constant ERR-ALREADY-VOTED (err u117))
+(define-constant ERR-PROPOSAL-NOT-PASSED (err u118))
+(define-constant ERR-PROPOSAL-ALREADY-EXECUTED (err u119))
+(define-constant ERR-INVALID-VOTING-PERIOD (err u120))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var property-counter uint u0)
 (define-data-var platform-fee uint u250)
 (define-data-var liquidity-fee uint u300)
 (define-data-var price-impact-factor uint u1000)
+(define-data-var proposal-counter uint u0)
+(define-data-var minimum-quorum uint u5000)
 
 (define-map properties
   { property-id: uint }
@@ -84,6 +93,27 @@
     price: uint,
     trader: principal
   }
+)
+
+(define-map proposals
+  { proposal-id: uint }
+  {
+    property-id: uint,
+    proposer: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    votes-for: uint,
+    votes-against: uint,
+    start-block: uint,
+    end-block: uint,
+    executed: bool,
+    passed: bool
+  }
+)
+
+(define-map proposal-votes
+  { proposal-id: uint, voter: principal }
+  { vote-weight: uint, vote-for: bool }
 )
 
 (define-public (create-property (address (string-ascii 200)) (property-value uint) (total-tokens uint))
@@ -618,5 +648,149 @@
       (- stx-received price-impact)
     )
     u0
+  )
+)
+
+(define-public (create-proposal 
+  (property-id uint) 
+  (title (string-ascii 100)) 
+  (description (string-ascii 500)) 
+  (voting-period uint)
+)
+  (let
+    (
+      (property (unwrap! (map-get? properties { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (proposal-id (+ (var-get proposal-counter) u1))
+      (end-block (+ stacks-block-height voting-period))
+    )
+    (asserts! (> user-tokens u0) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (> voting-period u0) ERR-INVALID-VOTING-PERIOD)
+    (asserts! (<= voting-period u10000) ERR-INVALID-VOTING-PERIOD)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        property-id: property-id,
+        proposer: tx-sender,
+        title: title,
+        description: description,
+        votes-for: u0,
+        votes-against: u0,
+        start-block: stacks-block-height,
+        end-block: end-block,
+        executed: false,
+        passed: false
+      }
+    )
+    
+    (var-set proposal-counter proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (property-id (get property-id proposal))
+      (user-tokens (get-user-tokens property-id tx-sender))
+      (existing-vote (map-get? proposal-votes { proposal-id: proposal-id, voter: tx-sender }))
+    )
+    (asserts! (> user-tokens u0) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+    (asserts! (< stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
+    
+    (map-set proposal-votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote-weight: user-tokens, vote-for: vote-for }
+    )
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal
+        {
+          votes-for: (if vote-for (+ (get votes-for proposal) user-tokens) (get votes-for proposal)),
+          votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) user-tokens))
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (property (unwrap! (map-get? properties { property-id: (get property-id proposal) }) ERR-PROPERTY-NOT-FOUND))
+      (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+      (quorum-threshold (/ (* (get total-tokens property) (var-get minimum-quorum)) u10000))
+      (passed (and 
+        (>= total-votes quorum-threshold)
+        (> (get votes-for proposal) (get votes-against proposal))
+      ))
+    )
+    (asserts! (>= stacks-block-height (get end-block proposal)) ERR-VOTING-NOT-ENDED)
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, passed: passed })
+    )
+    
+    (ok passed)
+  )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+  (map-get? proposal-votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-proposal-count)
+  (var-get proposal-counter)
+)
+
+(define-read-only (get-proposal-status (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal
+    (let
+      (
+        (property (unwrap! (map-get? properties { property-id: (get property-id proposal) }) (err false)))
+        (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+        (quorum-threshold (/ (* (get total-tokens property) (var-get minimum-quorum)) u10000))
+        (is-active (< stacks-block-height (get end-block proposal)))
+        (has-quorum (>= total-votes quorum-threshold))
+        (is-passing (> (get votes-for proposal) (get votes-against proposal)))
+      )
+      (ok {
+        is-active: is-active,
+        has-quorum: has-quorum,
+        is-passing: is-passing,
+        total-votes: total-votes,
+        quorum-needed: quorum-threshold,
+        blocks-remaining: (if is-active (- (get end-block proposal) stacks-block-height) u0)
+      })
+    )
+    (err false)
+  )
+)
+
+(define-read-only (get-minimum-quorum)
+  (var-get minimum-quorum)
+)
+
+(define-public (set-minimum-quorum (new-quorum uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-quorum u10000) ERR-INVALID-AMOUNT)
+    (asserts! (>= new-quorum u1000) ERR-INVALID-AMOUNT)
+    (var-set minimum-quorum new-quorum)
+    (ok true)
   )
 )
